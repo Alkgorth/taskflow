@@ -1,0 +1,69 @@
+stages:
+  - verify
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+.node-cache: &node-cache
+  key:
+    files:
+      - api/package-lock.json
+  paths:
+    - api/.npm/
+
+api:
+  stage: verify
+  image: node:${NODE_VERSION}-alpine
+  parallel:
+    matrix:
+      - NODE_VERSION: ["20", "22"]
+  cache: *node-cache
+  variables:
+    COVERAGE_MIN: "75"
+  script:
+    - cd api
+    - npm ci --cache .npm --prefer-offline
+    - npm run lint
+    - npm run format:check
+    - npm run test:coverage
+
+api-integration:
+  stage: verify
+  image: node:20-alpine
+  services:
+    - name: postgres:16-alpine
+      alias: postgres
+  variables:
+    POSTGRES_USER: taskflow
+    POSTGRES_PASSWORD: taskflow
+    POSTGRES_DB: taskflow
+    DATABASE_URL: postgres://taskflow:taskflow@postgres:5432/taskflow
+  cache: *node-cache
+  script:
+    - cd api
+    - npm ci --cache .npm --prefer-offline
+    - npm run test:int
+
+front:
+  stage: verify
+  image: node:20-alpine
+  cache:
+    key:
+      files:
+        - front/package-lock.json
+    paths:
+      - front/.npm/
+  script:
+    - cd front
+    - npm ci --cache .npm --prefer-offline
+    - npm run lint
+    - npm run format:check
+    - npm run test:coverage
+    - npm run build
+  artifacts:
+    name: front-dist
+    paths:
+      - front/dist/
+    expire_in: 7 days
