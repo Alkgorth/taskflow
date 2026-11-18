@@ -1,0 +1,227 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**.md"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag de rollback (7 caractères hexadécimaux, vide = build normal)"
+        required: false
+        default: ""
+        type: string
+      environment:
+        description: "Environnement cible pour un rollback"
+        required: false
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+
+permissions: {}
+
+jobs:
+  prepare:
+    name: Préparer le plan de déploiement
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      owner: ${{ steps.plan.outputs.owner }}
+      build: ${{ steps.plan.outputs.build }}
+      staging: ${{ steps.plan.outputs.staging }}
+      production: ${{ steps.plan.outputs.production }}
+    steps:
+      - id: plan
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_ENV: ${{ inputs.environment }}
+        run: |
+          echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+          if [ "$GITHUB_EVENT_NAME" = "push" ] || [ -z "$INPUT_TAG" ]; then
+            if [ "$GITHUB_REF_NAME" != "main" ]; then
+              echo "::error::Le build d'une release n'est autorisé que depuis main"
+              exit 1
+            fi
+            TAG="${GITHUB_SHA::7}"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "staging=true" >> "$GITHUB_OUTPUT"
+            echo "production=true" >> "$GITHUB_OUTPUT"
+            echo "### Plan : Déploiement complet ($TAG)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            if ! [[ "$INPUT_TAG" =~ ^[0-9a-f]{7}$ ]]; then
+              echo "::error::Tag invalide '$INPUT_TAG' (7 caractères hexadécimaux attendus)"
+              exit 1
+            fi
+            echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            if [ "$INPUT_ENV" = "staging" ]; then
+              echo "staging=true" >> "$GITHUB_OUTPUT"
+              echo "production=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "staging=false" >> "$GITHUB_OUTPUT"
+              echo "production=true" >> "$GITHUB_OUTPUT"
+            fi
+            echo "### Plan : Rollback vers $INPUT_TAG sur $INPUT_ENV" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  images:
+    name: Build & Scan (${{ matrix.component }})
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [api, front]
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Configurer Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Construire l'image localement (sans publier)
+        uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4 # v6.15.0
+        with:
+          context: ${{ matrix.component }}
+          load: true
+          push: false
+          build-args: |
+            APP_VERSION=${{ needs.prepare.outputs.tag }}
+          tags: |
+            ghcr.io/${{ needs.prepare.outputs.owner }}/taskflow-${{ matrix.component }}:${{ needs.prepare.outputs.tag }}
+            ghcr.io/${{ needs.prepare.outputs.owner }}/taskflow-${{ matrix.component }}:latest
+
+      - name: Scanner les vulnérabilités avec Trivy
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # v0.30.0
+        with:
+          image-ref: ghcr.io/${{ needs.prepare.outputs.owner }}/taskflow-${{ matrix.component }}:${{ needs.prepare.outputs.tag }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+          output: trivy-${{ matrix.component }}.txt
+
+      - name: Publier le rapport Trivy dans le résumé
+        if: ${{ !cancelled() }}
+        run: |
+          echo "### Rapport Trivy : ${{ matrix.component }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat trivy-${{ matrix.component }}.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Se connecter à ghcr.io
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publier les images scannées sur ghcr.io
+        run: |
+          docker push ghcr.io/${{ needs.prepare.outputs.owner }}/taskflow-${{ matrix.component }}:${{ needs.prepare.outputs.tag }}
+          docker push ghcr.io/${{ needs.prepare.outputs.owner }}/taskflow-${{ matrix.component }}:latest
+          echo "Publié : ghcr.io/${{ needs.prepare.outputs.owner }}/taskflow-${{ matrix.component }}:${{ needs.prepare.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-staging:
+    name: Déployer en Staging
+    needs: [prepare, images]
+    if: >-
+      !cancelled()
+      && needs.prepare.outputs.staging == 'true'
+      && (needs.images.result == 'success' || needs.images.result == 'skipped')
+    runs-on: [self-hosted, lab]
+    environment: staging
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Copier la configuration et les scripts dans STAGING_DIR
+        run: |
+          cp compose.staging.yaml deploy/deploy.sh deploy/smoke-test.sh "$STAGING_DIR/"
+          chmod +x "$STAGING_DIR/"*.sh
+
+      - name: Se connecter à ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Déployer la stack staging
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PORT: ${{ vars.FRONT_PORT || '8081' }}
+        run: |
+          cd "$STAGING_DIR"
+          COMPOSE_FILE=compose.staging.yaml ./deploy.sh "$TAG"
+          ./smoke-test.sh "http://host.docker.internal:${PORT}/health" "$TAG"
+
+      - name: Déconnecter ghcr.io
+        if: always()
+        run: docker logout ghcr.io || true
+
+  deploy-production:
+    name: Déployer en Production
+    needs: [prepare, images, deploy-staging]
+    if: >-
+      !cancelled()
+      && needs.prepare.outputs.production == 'true'
+      && (needs.images.result == 'success' || needs.images.result == 'skipped')
+      && (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped')
+    runs-on: [self-hosted, lab]
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Copier la configuration et les scripts dans PROD_DIR
+        run: |
+          mkdir -p "$PROD_DIR/nginx"
+          cp compose.prod.yaml deploy/*.sh "$PROD_DIR/"
+          cp deploy/nginx/taskflow.conf "$PROD_DIR/nginx/"
+          chmod +x "$PROD_DIR/"*.sh
+
+      - name: Se connecter à ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Sauvegarder et déployer la production
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          cd "$PROD_DIR"
+          ./backup.sh
+          COMPOSE_FILE=compose.prod.yaml ./deploy.sh "$TAG"
+
+      - name: Smoke test HTTPS
+        id: smoke
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PORT: ${{ vars.HTTPS_PORT || '443' }}
+        run: |
+          cd "$PROD_DIR"
+          ./smoke-test.sh "https://host.docker.internal:${PORT}/health" "$TAG" "certs/taskflow.crt"
+
+      - name: Rollback automatique si le smoke test échoue
+        if: failure() && steps.smoke.outcome == 'failure'
+        run: |
+          cd "$PROD_DIR"
+          if [ -f .previous_tag ]; then
+            PREV=$(cat .previous_tag)
+            echo "::warning::Smoke test KO, rollback automatique vers $PREV"
+            COMPOSE_FILE=compose.prod.yaml ./deploy.sh "$PREV"
+          fi
+          exit 1
+
+      - name: Déconnecter ghcr.io
+        if: always()
+        run: docker logout ghcr.io || true
