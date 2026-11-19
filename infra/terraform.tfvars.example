@@ -1,0 +1,4 @@
+ghcr_owner  = "alkgorth"
+image_tag   = "latest"
+front_port  = 8081
+environment = "staging"
