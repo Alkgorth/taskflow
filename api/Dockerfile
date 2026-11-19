@@ -7,6 +7,7 @@
 # Image de base : Node 20 sur Alpine Linux (une distribution minuscule, ~50 Mo).
 # On fixe la version majeure (20) pour que le build reste reproductible.
 FROM node:20-alpine
+RUN apk upgrade --no-cache
 
 # Dossier de travail dans l'image. Les commandes suivantes s'exécutent ici.
 WORKDIR /app
@@ -21,7 +22,8 @@ COPY package.json package-lock.json ./
 
 # `npm ci` : installation stricte d'après le package-lock.json (reproductible).
 # `--omit=dev` : on n'installe pas ESLint, Vitest... inutiles en production.
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev \
+    && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx /opt/yarn*
 
 # Maintenant seulement, on copie le code source (ce qui change souvent).
 COPY src ./src
