@@ -36,7 +36,7 @@ fi
 
 env_file="${STAGING_DIR:-}/.env"
 if [ -n "${STAGING_DIR:-}" ] && [ -f "$env_file" ]; then
-  password="$(sed -n 's/^POSTGRES_PASSWORD=//p' "$env_file" | tail -n 1)"
+  password="$(sed -n 's/^POSTGRES_PASSWORD=//p' "$env_file" | tail -n 1 | tr -d '\r')"
   if [ -n "$password" ]; then
     echo "::add-mask::$password"
     echo "TF_VAR_db_password=$password" >> "$GITHUB_ENV"
